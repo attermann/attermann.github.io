@@ -73,6 +73,8 @@ button.primary { background: var(--accent); color: var(--accent-ink); border-col
 .badge.secret { background: rgba(180,131,9,0.15); color: var(--warn); }
 .badge.reboot { background: rgba(37,99,235,0.15); color: var(--accent); }
 .badge.draft { background: rgba(37,99,235,0.15); color: var(--accent); }
+.badge.set-only { background: rgba(107,114,128,0.18); color: var(--muted); border: 1px dashed var(--border); padding: 0 5px; }
+.set-only-banner { margin: 8px 0 12px; padding: 8px 12px; background: rgba(107,114,128,0.10); border-left: 3px solid var(--muted); color: var(--ink); font-size: 12px; line-height: 1.45; border-radius: 3px; }
 /* Read-only info fields — render the value as static text, not an input. */
 .field.ro-info .ro-value { font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); padding: 5px 10px; background: rgba(107,114,128,0.08); border-radius: 4px; max-width: 360px; word-break: break-all; white-space: pre-wrap; min-height: 16px; }
 .field.ro-info .ro-value.empty { color: var(--muted); font-style: italic; }
@@ -105,6 +107,10 @@ button.primary { background: var(--accent); color: var(--accent-ink); border-col
 .logs { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 8px 12px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--panel); }
 .log-line { white-space: pre-wrap; word-break: break-all; }
 .follow-pill { position: absolute; bottom: 14px; right: 18px; padding: 5px 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--accent); color: var(--accent-ink); cursor: pointer; font: inherit; box-shadow: 0 1px 4px rgba(0,0,0,0.2); }
+<!-- LOGFILTER-BEGIN — stripped by webconsole/package.sh when --strip-logfilter is given -->
+.logs-filter { font: inherit; padding: 3px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel); color: var(--ink); min-width: 140px; }
+.logs-level { font: inherit; padding: 3px 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel); color: var(--ink); }
+<!-- LOGFILTER-END -->
 .notice { padding: 8px 12px; background: rgba(180,131,9,0.12); color: var(--warn); border-radius: 4px; margin-bottom: 12px; }
 .toasts { position: fixed; top: 56px; right: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; pointer-events: none; }
 .toast { padding: 10px 14px; background: var(--panel); border: 1px solid var(--border); border-left-width: 3px; border-radius: 4px; box-shadow: 0 2px 12px rgba(0,0,0,0.18); min-width: 220px; max-width: 360px; opacity: 0; transform: translateY(-8px); transition: opacity 0.2s, transform 0.2s; pointer-events: auto; }
@@ -144,6 +150,19 @@ pre { font: 12px/1.5 ui-monospace, Menlo, monospace; }
 .bt-mode-row button.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 .bt-mode-row button:disabled { opacity: 0.5; cursor: not-allowed; }
 .mode-current { padding: 10px 14px; background: rgba(37,99,235,0.08); border: 1px solid var(--accent); border-radius: 4px; margin-bottom: 16px; }
+/* While auto-reconnecting after Reboot now / transport drop: visually disable
+   panel-body controls. nsState / nodeCfgState are preserved across the window
+   (see startReconnect) so values stay visible, but edits would be lost when
+   the post-reconnect fetch overwrites them. */
+body.is-reconnecting input,
+body.is-reconnecting select,
+body.is-reconnecting textarea,
+body.is-reconnecting button.wo-send,
+body.is-reconnecting .ns-toolbar button,
+body.is-reconnecting .sidenav-detail button {
+  pointer-events: none;
+  opacity: 0.55;
+}
 </style>
 </head>
 <body>
@@ -159,8 +178,16 @@ const CMD_LOG=0x80, CMD_PROVISION_REQ=0x86, CMD_PROVISION_RSP=0x87;
 const CMD_RESET=0x55, CMD_RESET_BYTE=0xF8;
 const STAT_CMD_RANGE = [0x21, 0x29];
 
-const OP = { GetSchema:1, GetInfo:2, GetCapabilities:3, GetState:4, SetState:5, Commit:6, Discard:7, FactoryReset:8, Ack:100, Error:101 };
-const FT = { None:0, Bool:1, Int:2, Float:3, String:4, Bytes:5, Enum:6, BytesList:7 };
+// Optional schema baked in at packaging time. When BUNDLED_SCHEMA is non-null
+// and its hash/version match the device's GetInfo response, the web console
+// uses it directly and skips the GetSchema round-trip entirely — important
+// on LoRa where a full schema fetch is ~3 KB of airtime. The placeholder is
+// replaced by webconsole/package.sh from a build-time schema dump. Shape:
+//   { version: <int>, hash: <uint32>, schemaJson: "<serialised schema>" }
+const BUNDLED_SCHEMA = null;
+
+const OP = { GetSchema:1, GetInfo:2, GetCapabilities:3, GetState:4, SetState:5, Commit:6, Discard:7, FactoryReset:8, Reboot:9, Ack:100, Error:101 };
+const FT = { None:0, Bool:1, Int:2, Float:3, String:4, Bytes:5, Enum:6, BytesList:7, Void:8 };
 // Provisioning field flags (Field.h FF_*). Mutually exclusive uses:
 //  - READ_ONLY:  info-only field (e.g. metrics). Server has a getter; client
 //                must not draft it. Renders as static value display.
@@ -171,7 +198,21 @@ const FT = { None:0, Bool:1, Int:2, Float:3, String:4, Bytes:5, Enum:6, BytesLis
 const FF = { LIVE_APPLY:1, REBOOT_REQUIRED:2, READ_ONLY:4, SECRET:8, WRITE_ONLY:16 };
 const ERR_NAMES = { 0:'Ok', 1:'BadRequest', 2:'UnknownOp', 3:'UnknownNs', 4:'UnknownField', 5:'InvalidValue', 6:'Constraint', 7:'ReadOnly', 8:'StorageError', 9:'NotInitialized', 99:'Internal' };
 const FK = { Id:1, Name:2, Type:3, Flags:4, MinI:5, MaxI:6, MinF:7, MaxF:8, MaxLen:9, EnumValues:10, EnumLabels:11, Default:12, ElementSize:13, MaxCount:14 };
-const IK = { FirmwareVersion:1, SchemaVersion:2, NeedsReboot:3 };
+const IK = { FirmwareVersion:1, SchemaVersion:2, NeedsReboot:3, SchemaHash:4 };
+// Wire-level transport keys (request-payload and response-sentinel). Reserved
+// at 100+ to avoid collision with low-numbered field/ns identifiers.
+const WK = { ReqCompress:100, CompressedPayload:101 };
+// heatshrink decoder config — MUST match the firmware build flags in microReticulum heatshrink_config.h.
+const HS_WINDOW_BITS    = 9;
+const HS_LOOKAHEAD_BITS = 4;
+// Ops where a ReqCompress flag is safe to inject in the request payload.
+// SetState / Commit / Discard use different payload shapes (map keyed by
+// ns-id, or array) where injecting a flag would conflict; their responses
+// are also small and don't benefit from compression.
+const COMPRESSIBLE_OPS = new Set([
+  OP.GetSchema, OP.GetInfo, OP.GetCapabilities, OP.GetState,
+  OP.FactoryReset, OP.Reboot,
+]);
 const GK = { NamespaceFilter:1, Pending:2 };
 const SK = { Applied:1, DraftHasReboot:2, FieldErrors:3 };
 const CK = { Applied:1, NeedsReboot:2 };
@@ -308,8 +349,16 @@ const NODE_CONFIG_SCHEMA = {
         cmd: CMD_CR, minI: 5, maxI: 8, default: 5 },
       { id: 'txp', name: 'txp', label: 'TX power', type: FT.Int, encoding: 'i8',
         cmd: CMD_TXPOWER, minI: -9, maxI: 22, unit: 'dBm', default: 0 },
+      // CMD_DIS_IA: firmware byte 0x00 = IA enabled, 0x01 = IA disabled.
+      // Exposed as a positive "Interference avoidance" toggle and inverted at
+      // the wire. Set-only on the wire (no read counterpart), so the badge in
+      // the row makes that clear — the rest of the Radio fields stay readable.
+      { id: 'ia', name: 'ia', label: 'Interference avoidance', type: FT.Bool,
+        cmd: CMD_DIS_IA, encoding: 'u8',
+        toWire: (v) => v ? 0x00 : 0x01, fromWire: (b) => b === 0x00,
+        default: false, readable: false },
     ],
-    saveOrder: ['frequency','bandwidth','sf','cr','txp'],
+    saveOrder: ['frequency','bandwidth','sf','cr','txp','ia'],
   },
   bluetooth: {
     label: 'Bluetooth',
@@ -336,81 +385,10 @@ const NODE_CONFIG_SCHEMA = {
     ],
     saveOrder: ['mode','channel','ssid','psk','ip','nm'],
     saveTrailerNote: 'Settings are written to the WiFi config sector and take effect on the next reboot.',
-    // ──────────────────────────────────────────────────────────────────
-    //  ⚠ FRAGILE: WiFi values are recovered by dumping raw EEPROM and
-    //  decoding at hardcoded offsets. The CMD_WIFI_* opcodes are
-    //  write-only in the firmware — there's no read counterpart — so the
-    //  only way to "Refresh" or display persisted values after a reboot
-    //  is to read EEPROM directly and trust the layout.
-    //
-    //  Dependencies (any of these breaking silently corrupts the display):
-    //    • ROM.h:55-60       — ADDR_CONF_SSID=0x00 / PSK=0x21 / IP=0x42 /
-    //                          NM=0x46 inside the 256-byte CONFIG sector
-    //    • ROM.h:47-48       — ADDR_CONF_WIFI=0xBA (mode) /
-    //                          ADDR_CONF_WCHN=0xBB (channel) in main EEPROM
-    //    • Boards.h          — CONFIG_OFFSET=0, EEPROM_OFFSET=EEPROM_SIZE
-    //                          -EEPROM_RESERVED. Different layouts on
-    //                          non-ESP32 platforms aren't handled here.
-    //    • CMD_CFG_READ      — the firmware gates this on
-    //                          `#if MCU_VARIANT == MCU_ESP32` (no NRF52 /
-    //                          AVR support). NRF52 falls back to a partial
-    //                          read with only mode/channel from main EEPROM.
-    //    • 0xFF sentinel     — uninitialised EEPROM bytes are 0xFF. The
-    //                          decoder treats a 0xFF run as "no value".
-    //
-    //  Better long-term fix: extend the firmware with read-side CMD_WIFI_*
-    //  opcodes (or a single CMD_WIFI_GET that returns the parsed struct).
-    //  Once available, drop this readFn and add `readable: true` to each
-    //  field so the generic legacy.readSection path handles them.
-    // ──────────────────────────────────────────────────────────────────
-    // Cached copies in state.nodeCfgEeprom / state.nodeCfgCfgSector are
-    // refreshed here so the EEPROM viewer also sees the latest bytes.
-    readFn: async (lc) => {
-      const out = {};
-      // Helper: decode a C-string in `buf` starting at offset, max `len` bytes.
-      // Stops at the first 0x00 or 0xFF (uninitialised EEPROM defaults to 0xFF).
-      const decodeCstr = (buf, start, max) => {
-        if (!buf) return '';
-        const end = Math.min(start + max, buf.length);
-        let n = start;
-        while (n < end && buf[n] !== 0x00 && buf[n] !== 0xFF) n++;
-        try { return new TextDecoder('utf-8', { fatal: false }).decode(buf.slice(start, n)); }
-        catch (_) { return ''; }
-      };
-      // ip4: 4 octets. 0xFF.0xFF.0xFF.0xFF means uninitialised → treat as DHCP.
-      const decodeIp = (buf, start) => {
-        if (!buf || buf.length < start + 4) return '0.0.0.0';
-        if (buf[start]===0xFF && buf[start+1]===0xFF && buf[start+2]===0xFF && buf[start+3]===0xFF) return '0.0.0.0';
-        return `${buf[start]}.${buf[start+1]}.${buf[start+2]}.${buf[start+3]}`;
-      };
-      try {
-        const cfg = await lc.readCfgSector();
-        state.nodeCfgCfgSector.set(cfg);
-        out.ssid = decodeCstr(cfg, 0x00, 32);
-        out.psk  = decodeCstr(cfg, 0x21, 32);
-        out.ip   = decodeIp(cfg, 0x42);
-        out.nm   = decodeIp(cfg, 0x46);
-      } catch (e) {
-        // CMD_CFG_READ not supported on this board (NRF52 path) — fall through
-        // with only the values we can read from main EEPROM.
-        console.warn('WiFi readFn: cfg sector read failed:', e.message || e);
-      }
-      try {
-        const ee = await lc.readEeprom();
-        state.nodeCfgEeprom.set(ee);
-        if (ee && ee.length > 0xBB) {
-          const m = ee[0xBA];
-          const c = ee[0xBB];
-          // Only surface values that look initialised. 0xFF on a fresh
-          // EEPROM means "no value" — leave it to the field default.
-          if (m === 0x00 || m === 0x01 || m === 0x02) out.mode = m;
-          if (c >= 1 && c <= 13) out.channel = c;
-        }
-      } catch (e) {
-        console.warn('WiFi readFn: EEPROM read failed:', e.message || e);
-      }
-      return out;
-    },
+    // CMD_WIFI_* opcodes are write-only in the firmware — there's no read
+    // counterpart and we won't decode raw EEPROM at hardcoded offsets. Fields
+    // surface as "set-only" in the UI (per-field badge + section banner);
+    // edits write to the device but values can't be read back.
   },
   display: {
     label: 'Display',
@@ -427,14 +405,8 @@ const NODE_CONFIG_SCHEMA = {
         cmd: CMD_DISP_ADDR, minI: 0, maxI: 255, default: 0x3C, readable: false },
       { id: 'np', name: 'np', label: 'NeoPixel intensity', type: FT.Int, encoding: 'u8',
         cmd: CMD_NP_INT, minI: 0, maxI: 255, default: 0, readable: false },
-      // CMD_DIS_IA: firmware byte 0x00 = IA enabled, 0x01 = IA disabled.
-      // We expose it as a positive "Interference avoidance" toggle and invert at the wire.
-      { id: 'ia', name: 'ia', label: 'Interference avoidance', type: FT.Bool,
-        cmd: CMD_DIS_IA, encoding: 'u8',
-        toWire: (v) => v ? 0x00 : 0x01, fromWire: (b) => b === 0x00,
-        default: true, readable: false },
     ],
-    saveOrder: ['intensity','blanking','rotation','addr','np','ia'],
+    saveOrder: ['intensity','blanking','rotation','addr','np'],
   },
   eeprom: {
     label: 'EEPROM',
@@ -889,6 +861,511 @@ class WebSocketTransport {
   }
 }
 
+// ===== RNS-over-MeshChatX transport =====
+// Bridges the upper-layer KISS-framed Provisioning protocol to MeshChatX's
+// generic rns.link.* WebSocket API, which terminates on an RNS Link to the
+// remote node. CMD_PROVISION_REQ frames are unwrapped to rns.link.request
+// payloads; the request body comes back, gets re-wrapped as CMD_PROVISION_RSP,
+// and is pushed to onBytes so ProvisioningClient sees the exchange unchanged.
+class RnsTransport {
+  constructor(){
+    this.ws = null;
+    this.params = null;          // { meshchatxUrl, destinationHash, aspect, autoIdentify }
+    this.onBytes = () => {};
+    this.onStatus = () => {};
+    this._userClosing = false;
+    // True once an involuntary close (RNS link_closed broadcast, no_active_link
+    // reply, etc.) has fired _handleInvoluntaryClose — keeps the teardown
+    // path idempotent under racing signals.
+    this._involuntaryClosed = false;
+    this._reqIdCounter = 1;
+    this._waiters = new Map();   // request_id → { onSuccess(body), onFailure(reason), onPhase?, onProgress? }
+    this._pingWaiter = null;     // { resolve, reject, timerId } — for ws-verify ping/pong
+    this._kissOut = new KissDecoder((cmd, payload) => this._onOutgoingKissFrame(cmd, payload));
+    this._unloadHandler = null;  // bound page-unload listener (attached during connect)
+    // Advertised default for ProvisioningClient.request timeouts when this
+    // transport is in use. LoRa Resource transfers commonly take 10-30s for
+    // schemas; the snappy 5s default used on Serial/BLE/WebSocket times out
+    // before the response can land. ProvisioningClient picks this up via
+    // duck-typing if the property is set on the transport.
+    this.defaultRequestTimeoutMs = 30000;
+    // Bytes are expensive on LoRa — request heatshrink-compressed responses
+    // for bulky ops (schema, state). ProvisioningClient inspects this flag.
+    this.compressionPreferred = true;
+  }
+
+  // Server phase strings → user-friendly status labels.
+  static PHASE_LABELS = {
+    finding_path: 'Finding path',
+    establishing_link: 'Establishing link',
+    identifying: 'Authenticating',
+  };
+
+  // Server failure_reason strings → human-friendly error messages.
+  static FAILURE_LABELS = {
+    no_path_to_destination: 'No path to destination (no announce received yet?)',
+    link_establishment_timeout: 'Link establishment timed out',
+    no_identity_for_destination: 'Identity not recalled for destination',
+    no_local_identity: 'No local identity available on MeshChatX',
+    no_active_link: 'Link is not active',
+    ws_closed: 'WebSocket disconnected',
+    timeout: 'Operation timed out',
+    ws_verify_timeout: 'MeshChatX did not respond to ping',
+    missing_destination_or_aspect: 'Missing destination hash or aspect',
+    invalid_destination_hash: 'Destination hash is not valid hex',
+  };
+  static _friendlyFailure(reason){
+    if (!reason) return 'failure';
+    return RnsTransport.FAILURE_LABELS[reason] || reason;
+  }
+  static available(){ return true; }
+
+  _nextReqId(){ return this._reqIdCounter++; }
+
+  static _b64Encode(bytes){
+    let s = '';
+    for (let i = 0; i < bytes.length; ++i) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+  }
+  static _b64Decode(b64){
+    if (!b64) return new Uint8Array(0);
+    const s = atob(b64);
+    const out = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; ++i) out[i] = s.charCodeAt(i);
+    return out;
+  }
+
+  async connect(params){
+    this.params = params;
+    this._involuntaryClosed = false;
+    const { meshchatxUrl, destinationHash, aspect, autoIdentify } = params;
+    if (!meshchatxUrl) throw new Error('missing MeshChatX URL');
+    if (!destinationHash || !/^[0-9a-fA-F]{32}$/.test(destinationHash))
+      throw new Error('destination hash must be 32 hex characters');
+    if (!aspect) throw new Error('missing aspect');
+
+    // Stage 1: open the WebSocket to MeshChatX.
+    this.onStatus({state:'connecting', info: 'WS connecting'});
+    await new Promise((resolve, reject) => {
+      try {
+        this.ws = new WebSocket(meshchatxUrl);
+        let opened = false;
+        this.ws.onopen = () => {
+          opened = true;
+          // Attach unload handlers immediately on WS open. From this point on,
+          // a page refresh / tab close can race with an in-flight rns.link.open,
+          // and we want a synchronous best-effort teardown to ride along.
+          this._attachUnloadHandlers();
+          resolve();
+        };
+        this.ws.onmessage = (e) => this._onWsMessage(e);
+        this.ws.onerror = () => { if (!opened) reject(new Error('WebSocket connect failed (check URL / TLS / firewall)')); };
+        this.ws.onclose = () => {
+          // Fail any in-flight waiters so callers don't hang.
+          for (const w of this._waiters.values()) { try { w.onFailure && w.onFailure('ws_closed'); } catch(_) {} }
+          this._waiters.clear();
+          if (this._pingWaiter) {
+            const w = this._pingWaiter; this._pingWaiter = null;
+            try { clearTimeout(w.timerId); } catch(_) {}
+            try { w.reject(new Error('ws_closed')); } catch(_) {}
+          }
+          this._detachUnloadHandlers();
+          this.onStatus({state: this._userClosing ? 'idle' : 'closed'});
+        };
+      } catch (e) { this.onStatus({state:'error', info: e.message}); reject(e); }
+    });
+
+    // Stage 2: verify the WS is actually a working MeshChatX endpoint
+    // (and not, say, a different server that happens to accept WS upgrades)
+    // by sending a ping and waiting for a pong. Confirms bidirectional
+    // message flow before we commit to the slow Link setup.
+    this.onStatus({state:'connecting', info: 'WS verifying'});
+    try {
+      await this._pingServer(5000);
+    } catch (e) {
+      const reason = e && e.message === 'timeout' ? 'ws_verify_timeout' : (e.message || 'ws_verify_failed');
+      this.onStatus({state:'error', info: RnsTransport._friendlyFailure(reason)});
+      try { this.ws && this.ws.close(); } catch(_) {}
+      throw new Error(reason);
+    }
+
+    // Stage 3: open the Link (and optionally identify) via the MeshChatX backend.
+    // The server emits 'phase' events as it makes progress through path discovery,
+    // link establishment, and identification — surface them as their friendly labels.
+    this.onStatus({state:'connecting', info: 'Link connecting'});
+    try {
+      const result = await this._sendAndWait('rns.link.open', {
+        destination_hash: destinationHash.toLowerCase(),
+        aspect,
+        auto_identify: !!autoIdentify,
+      }, {
+        // Idle-timer resets on each phase event (finding_path →
+        // establishing_link → identifying), so a server making progress won't
+        // trip this even on slow LoRa.
+        timeoutMs: 30000,
+        onPhase: (phase) => {
+          const label = RnsTransport.PHASE_LABELS[phase] || phase;
+          this.onStatus({state:'connecting', info: label});
+        },
+      });
+      const ident = result && result.identified ? ' (identified)' : '';
+      this.onStatus({state:'connected', info: aspect + ' @ ' + destinationHash.slice(0,8) + ident});
+    } catch (e) {
+      const reason = (e && e.message) || 'failure';
+      this.onStatus({state:'error', info: RnsTransport._friendlyFailure(reason)});
+      try { this.ws && this.ws.close(); } catch(_) {}
+      throw e;
+    }
+  }
+
+  // Best-effort synchronous teardown when the page is being unloaded
+  // (reload, tab close, navigation). Without this, the server keeps polling
+  // path-discovery / link-establishment for an in-flight rns.link.open, may
+  // cache a half-finished link, and emits broadcast events to a renderer
+  // that's already torn down. We can't await here — the page is dying — but
+  // browsers do flush queued WebSocket frames before the connection terminates,
+  // so a fire-and-forget rns.link.close + a clean WebSocket.close(1000) gets the
+  // message to the server in practice.
+  _attachUnloadHandlers(){
+    if (this._unloadHandler) return;
+    this._unloadHandler = () => {
+      try {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN && this.params) {
+          this.ws.send(JSON.stringify({
+            type: 'rns.link.close',
+            request_id: this._nextReqId(),
+            destination_hash: this.params.destinationHash.toLowerCase(),
+            aspect: this.params.aspect,
+          }));
+          // Status 1000 = normal closure. Without this the browser may emit
+          // an abnormal-close (1006) which the server can't distinguish from a
+          // network error.
+          this.ws.close(1000, 'page-unload');
+        }
+      } catch (_) { /* page is dying; nothing useful to do */ }
+    };
+    window.addEventListener('beforeunload', this._unloadHandler);
+    window.addEventListener('pagehide', this._unloadHandler);
+  }
+
+  _detachUnloadHandlers(){
+    if (!this._unloadHandler) return;
+    window.removeEventListener('beforeunload', this._unloadHandler);
+    window.removeEventListener('pagehide', this._unloadHandler);
+    this._unloadHandler = null;
+  }
+
+  // Send a {type:"ping"} JSON frame and wait for the matching {type:"pong"}.
+  // MeshChatX's main /ws bus has supported this since the WebSocket API was
+  // documented (meshchatx_api.md §2.1).
+  _pingServer(timeoutMs){
+    return new Promise((resolve, reject) => {
+      const timerId = setTimeout(() => {
+        if (this._pingWaiter && this._pingWaiter.timerId === timerId) {
+          this._pingWaiter = null;
+          reject(new Error('timeout'));
+        }
+      }, timeoutMs);
+      this._pingWaiter = { resolve, reject, timerId };
+      try { this.ws.send(JSON.stringify({type:'ping'})); }
+      catch (e) {
+        clearTimeout(timerId);
+        this._pingWaiter = null;
+        reject(e);
+      }
+    });
+  }
+
+  async reconnect(){
+    if (!this.params) throw new Error('no params to reconnect');
+    this._userClosing = false;
+    await this.connect(this.params);
+  }
+
+  // The upper layer hands us KISS bytes. Decode the frame; if it's a
+  // PROVISION_REQ, unwrap it onto rns.link.request. Other opcodes are silently
+  // dropped (legacy KISS / CMD_RESET / etc are not transported over this link).
+  async send(bytes){
+    this._kissOut.feed(bytes);
+  }
+
+  _onOutgoingKissFrame(cmd, payload){
+    if (cmd !== CMD_PROVISION_REQ) return;
+    const { destinationHash, aspect } = this.params;
+    this._sendAndWait('rns.link.request', {
+      destination_hash: destinationHash.toLowerCase(),
+      aspect,
+      path: '/provision',
+      data_b64: RnsTransport._b64Encode(payload),
+    }, {
+      onSuccess: (body) => {
+        const respPayload = RnsTransport._b64Decode(body.body_b64 || '');
+        const frame = kissEncode(CMD_PROVISION_RSP, respPayload);
+        try { this.onBytes(frame); } catch(_) {}
+      },
+      // Generic failures (timeout, etc.) drop — ProvisioningClient's own
+      // request timeout rejects the caller cleanly. But 'no_active_link' is
+      // MeshChatX's authoritative "this link is gone" reply: fast-path the
+      // transport into the involuntary-close teardown so we surface the drop
+      // and (if autoReconnect is on) kick startReconnect right away, rather
+      // than waiting for the broadcast / per-request UI timeout. 'ws_closed'
+      // is belt-and-suspenders against ws.onclose racing with an in-flight
+      // waiter — _handleInvoluntaryClose is idempotent.
+      onFailure: (reason) => {
+        if (reason === 'no_active_link' || reason === 'ws_closed') {
+          this._handleInvoluntaryClose(reason);
+        }
+      },
+    });
+  }
+
+  async disconnect(){
+    this._userClosing = true;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.params) {
+      try {
+        await this._sendAndWait('rns.link.close', {
+          destination_hash: this.params.destinationHash.toLowerCase(),
+          aspect: this.params.aspect,
+        }, {});
+      } catch(_) {}
+    }
+    try { if (this.ws) this.ws.close(); } catch(_) {}
+    this.ws = null;
+  }
+
+  async forceClose(){
+    this._userClosing = false;
+    // Evict MeshChatX's cached link for our (aspect, destination_hash) before
+    // tearing down the WS. MeshChatX caches by remote, not by client, and
+    // reuses the cache on the next rns.link.open until its own keepalive
+    // expires — so after a remote Reboot the rebuilt session would otherwise
+    // inherit a stale link that's already dead on the RNS side. Fire-and-
+    // forget: browsers flush queued WS frames before close (same pattern as
+    // the page-unload handler above), so the close request reaches MeshChatX
+    // and we don't have to block on a reply we don't need.
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.params) {
+      try {
+        this.ws.send(JSON.stringify({
+          type: 'rns.link.close',
+          request_id: this._nextReqId(),
+          destination_hash: this.params.destinationHash.toLowerCase(),
+          aspect: this.params.aspect,
+        }));
+      } catch(_) {}
+    }
+    try { if (this.ws) this.ws.close(); } catch(_) {}
+  }
+
+  // Fired when the RNS Link or the underlying WS goes down without us asking
+  // (MeshChatX link_closed broadcast, no_active_link reply on a request, etc).
+  // Fails in-flight waiters immediately so callers don't sit on a 30s
+  // ProvisioningClient timeout, then closes the WS — ws.onclose is what
+  // actually emits 'closed' onStatus (since _userClosing stays false), which
+  // routes through onTransportStatus to startReconnect when autoReconnect is
+  // on. Idempotent so concurrent signals (broadcast + request failure +
+  // ws.onclose racing during a remote reboot) collapse to one teardown.
+  _handleInvoluntaryClose(reason){
+    if (this._involuntaryClosed) return;
+    this._involuntaryClosed = true;
+    for (const w of this._waiters.values()) {
+      try { w.onFailure && w.onFailure(reason); } catch(_) {}
+    }
+    this._waiters.clear();
+    try { if (this.ws) this.ws.close(); } catch(_) {}
+  }
+
+  // Send a JSON command and return a promise that resolves on the matching
+  // {status:"success"} frame and rejects on {status:"failure"} or after
+  // timeoutMs of idle (phase/progress events count as activity and reset the
+  // idle timer). Optional onPhase/onProgress callbacks consume intermediate
+  // frames.
+  _sendAndWait(type, body, { onPhase, onProgress, onSuccess, onFailure, timeoutMs = 15000 } = {}){
+    const request_id = this._nextReqId();
+    const frame = Object.assign({ type, request_id }, body);
+    return new Promise((resolve, reject) => {
+      let timerId = null;
+      const armTimer = () => {
+        if (timerId !== null) clearTimeout(timerId);
+        timerId = setTimeout(() => {
+          if (!this._waiters.has(request_id)) return;
+          this._waiters.delete(request_id);
+          try { onFailure && onFailure('timeout'); } catch(_) {}
+          reject(new Error(type + ' timeout after ' + timeoutMs + 'ms'));
+        }, timeoutMs);
+      };
+      this._waiters.set(request_id, {
+        onPhase: (p) => { armTimer(); if (onPhase) try { onPhase(p); } catch(_) {} },
+        onProgress: (pr) => { armTimer(); if (onProgress) try { onProgress(pr); } catch(_) {} },
+        onSuccess: (msg) => { if (timerId !== null) clearTimeout(timerId); if (onSuccess) try { onSuccess(msg); } catch(_) {} resolve(msg); },
+        onFailure: (reason) => { if (timerId !== null) clearTimeout(timerId); if (onFailure) try { onFailure(reason); } catch(_) {} reject(new Error(reason || 'failure')); },
+      });
+      try { this.ws.send(JSON.stringify(frame)); armTimer(); }
+      catch (e) { if (timerId !== null) clearTimeout(timerId); this._waiters.delete(request_id); reject(e); }
+    });
+  }
+
+  _onWsMessage(e){
+    let msg;
+    try { msg = JSON.parse(typeof e.data === 'string' ? e.data : new TextDecoder().decode(e.data)); }
+    catch (_) { return; }
+    if (!msg || typeof msg.type !== 'string') return;
+
+    // ws-verify ping/pong (used during connect() stage 2).
+    if (msg.type === 'pong') {
+      const w = this._pingWaiter;
+      if (w) { this._pingWaiter = null; try { clearTimeout(w.timerId); } catch(_) {} w.resolve(msg); }
+      return;
+    }
+    if (!msg.type.startsWith('rns.link.')) return; // ignore other broadcasts (config, announce, …)
+
+    // Async server-pushed events (no request_id correlation). MeshChatX fires
+    // rns.link.event { event: 'link_closed' } from RNS's link_closed_callback —
+    // so it covers remote teardowns, RNS-detected link timeouts (e.g. after a
+    // remote reboot), and our own teardown alike. (packet_received variants
+    // are out of scope — Provisioning is request/response, so unsolicited
+    // packets have no consumer yet.)
+    if (msg.type === 'rns.link.event') {
+      if (msg.event !== 'link_closed') return;
+      // The broadcast bus is per-MeshChatX-instance: events for other links
+      // (different destination_hash / aspect) share it, so filter to ours.
+      const dh = (msg.destination_hash || '').toLowerCase();
+      const wantDh = (this.params && this.params.destinationHash || '').toLowerCase();
+      if (!wantDh || dh !== wantDh) return;
+      if (this.params && msg.aspect !== this.params.aspect) return;
+      // Suppress for our own disconnect() — link_closed fires for our
+      // outbound rns.link.close too, and we don't want auto-reconnect to
+      // engage after the user clicked Disconnect.
+      if (this._userClosing) return;
+      this._handleInvoluntaryClose('link_closed');
+      return;
+    }
+
+    const w = this._waiters.get(msg.request_id);
+    if (!w) return;
+    const status = msg.status;
+    if (status === 'phase') { if (w.onPhase) try { w.onPhase(msg.phase); } catch(_) {} return; }
+    if (status === 'progress') { if (w.onProgress) try { w.onProgress(msg.progress); } catch(_) {} return; }
+    // Terminal frame — drop the waiter.
+    this._waiters.delete(msg.request_id);
+    if (status === 'success') { w.onSuccess(msg); }
+    else { w.onFailure(msg.failure_reason || 'failure'); }
+  }
+}
+
+// ===== Schema cache helpers =====
+// Schemas are content-addressed by the firmware's CRC32 hash (info.schemaHash),
+// so two devices reporting the same hash share the same cached entry. We cap
+// the total number of cached schemas at SCHEMA_CACHE_MAX to bound storage
+// growth as a user connects to many devices over time.
+const SCHEMA_CACHE_PREFIX = 'mrf_schema_v';
+const SCHEMA_CACHE_MAX    = 5;
+
+// Convert Uint8Array (bytes-typed defaults) to a JSON-safe tagged form. Most
+// schema fields are plain primitives, so this is rarely needed in practice.
+function _schemaJsonReplacer(_k, v){
+  if (v && v.constructor === Uint8Array) {
+    let s = '';
+    for (let i = 0; i < v.length; i++) s += String.fromCharCode(v[i]);
+    return { __u8: btoa(s) };
+  }
+  return v;
+}
+function _schemaJsonReviver(_k, v){
+  if (v && typeof v === 'object' && typeof v.__u8 === 'string' && Object.keys(v).length === 1) {
+    const s = atob(v.__u8);
+    const out = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+    return out;
+  }
+  return v;
+}
+function _schemaSerialize(schema){
+  return JSON.stringify(schema, _schemaJsonReplacer);
+}
+function _schemaDeserialize(str){
+  return JSON.parse(str, _schemaJsonReviver);
+}
+// Evict the oldest entries to keep cache size bounded. Called before writing
+// a new key; the `keepKey` arg ensures we don't evict the entry we're about
+// to write if it already exists (LRU-bump semantics).
+function _schemaCachePrune(keepKey){
+  if (!window.localStorage) return;
+  const keys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith(SCHEMA_CACHE_PREFIX) && k !== keepKey) keys.push(k);
+  }
+  // localStorage doesn't expose write order, so eviction is approximate —
+  // we drop in iteration order until under the cap. Good enough for an
+  // O(<=5) cache that's only churned when a user touches many devices.
+  while (keys.length >= SCHEMA_CACHE_MAX) {
+    const victim = keys.shift();
+    try { localStorage.removeItem(victim); } catch(_) {}
+  }
+}
+
+// ===== heatshrink decoder =====
+// Minimal LZSS decoder matching the firmware's heatshrink_encoder output.
+// Static config must agree with the build flags in platformio.ini —
+// changing HS_WINDOW_BITS / HS_LOOKAHEAD_BITS here without matching the
+// firmware will silently corrupt every decode.
+//
+// Token layout (MSB-first within each byte):
+//   1 tag bit:
+//     '1' followed by 8 bits → literal byte
+//     '0' followed by (window_bits + lookahead_bits) → backref { offset+1, length+2 }
+// EOF detection: stop when we can't read the next tag bit (out of input).
+function heatshrinkDecode(input){
+  const out = [];
+  let bitPos = 0;
+  const totalBits = input.length * 8;
+  function readBits(n){
+    if (bitPos + n > totalBits) return -1;
+    let v = 0;
+    for (let i = 0; i < n; i++) {
+      const byteIdx = bitPos >> 3;
+      const bitInByte = 7 - (bitPos & 7);
+      v = (v << 1) | ((input[byteIdx] >> bitInByte) & 1);
+      bitPos++;
+    }
+    return v;
+  }
+  while (bitPos < totalBits) {
+    const tag = readBits(1);
+    if (tag < 0) break;
+    if (tag === 1) {
+      const b = readBits(8);
+      if (b < 0) break;
+      out.push(b);
+    } else {
+      const offRaw = readBits(HS_WINDOW_BITS);
+      if (offRaw < 0) break;
+      const lenRaw = readBits(HS_LOOKAHEAD_BITS);
+      if (lenRaw < 0) break;
+      // heatshrink encodes offset and length as (real-value - 1) on the
+      // wire — see heatshrink_decoder.c HSDS_BACKREF_INDEX_LSB /
+      // HSDS_BACKREF_COUNT_LSB states. Minimum match length is 2 (a
+      // 1-byte match would cost more bits than a literal), so wire_length
+      // ranges 1..(2^lookahead_bits - 1) → real_length 2..(2^lb).
+      const offset = offRaw + 1;
+      const length = lenRaw + 1;
+      // The C encoder/decoder both pre-zero a (1<<HS_WINDOW_BITS) byte
+      // sliding window (memset in heatshrink_{en,de}coder.c::reset), and
+      // the encoder is allowed to emit backrefs that point into that
+      // zero region — i.e., "before" any byte has actually been emitted.
+      // Treat negative indices as that virtual zero source rather than
+      // bailing; bailing silently truncates every stream that compresses
+      // an early zero run (common for msgpack float64 metrics).
+      const start = out.length - offset;
+      for (let i = 0; i < length; i++) {
+        const idx = start + i;
+        out.push(idx < 0 ? 0 : out[idx]);
+      }
+    }
+  }
+  return new Uint8Array(out);
+}
+
 // ===== Provisioning client =====
 class ProvisioningClient {
   constructor(transport){
@@ -902,6 +1379,11 @@ class ProvisioningClient {
     this.onLegacyFrame = () => {};
     this.decoder = new KissDecoder((cmd, payload) => this._onFrame(cmd, payload));
     this.t.onBytes = (b) => this.decoder.feed(b);
+    // Whether to ask the server for compressed responses on bulky ops.
+    // Picked up by duck-typing from the transport (LoRa-backed transports
+    // set `compressionPreferred = true`). Local Serial / WebSocket leave
+    // it false: bytes are cheap there and decompression adds latency.
+    this.compressionEnabled = !!(transport && transport.compressionPreferred);
   }
   _onFrame(cmd, payload){
     if (cmd === CMD_PROVISION_RSP) this._onResponse(payload);
@@ -916,18 +1398,50 @@ class ProvisioningClient {
     if (!Array.isArray(env) || env.length < 2) return;
     const op = Number(env[0]);
     const seq = Number(env[1]);
-    const body = env.length >= 3 ? env[2] : null;
+    let body = env.length >= 3 ? env[2] : null;
     const w = this.waiters.get(seq);
     if (!w) return;
     this.waiters.delete(seq);
     clearTimeout(w.timeoutId);
+    // Compressed-payload sentinel: a single-key map { CompressedPayload: <bin> }
+    // whose value decompresses to the original MsgPack-encoded payload.
+    // Transparent to the dispatch below — once decoded, body looks identical
+    // to what an uncompressed response would have produced.
+    if (body instanceof Map && body.size === 1 && body.has(WK.CompressedPayload)) {
+      const bin = body.get(WK.CompressedPayload);
+      if (bin instanceof Uint8Array) {
+        try {
+          const raw = heatshrinkDecode(bin);
+          body = new Unpacker(raw).next();
+        } catch (e) {
+          console.error('compressed payload decode failed:', e);
+          w.reject(new Error('failed to decompress response: ' + (e && e.message)));
+          return;
+        }
+      }
+    }
     if (op === OP.Error) {
-      const m = body instanceof Map ? body : new Map();
-      const err = new Error(m.get(EK.Message) || 'Provisioning error');
-      err.code = m.get(EK.Code) ?? 99;
-      err.codeName = ERR_NAMES[err.code] || 'Unknown';
-      err.ns = m.get(EK.Namespace);
-      err.field = m.get(EK.Field);
+      // Defensive against decoders that hand us a plain Object instead of a
+      // Map for int-keyed msgpack maps. Some JS msgpack libs surface int keys
+      // as Map entries, others coerce to string-keyed Object — handle both.
+      const getF = (key) => {
+        if (body instanceof Map) return body.get(key);
+        if (body && typeof body === 'object') {
+          if (key in body) return body[key];
+          const skey = String(key);
+          if (skey in body) return body[skey];
+        }
+        return undefined;
+      };
+      const msg = getF(EK.Message) || 'Provisioning error';
+      const code = getF(EK.Code) ?? 99;
+      const codeName = ERR_NAMES[code] || 'Unknown';
+      const err = new Error(`${msg} (code ${code} ${codeName})`);
+      err.code = code;
+      err.codeName = codeName;
+      err.message_raw = msg;
+      err.ns = getF(EK.Namespace);
+      err.field = getF(EK.Field);
       w.reject(err);
     } else {
       w.resolve({ op, body });
@@ -936,13 +1450,33 @@ class ProvisioningClient {
   async _request(opId, packPayload, timeoutMs){
     const seq = this.seq++;
     const p = new Packer();
-    const has = !!packPayload;
+    // Compression negotiation: for ops whose payload either is currently nil
+    // (no map) or already a map of "options" with known keys, optionally
+    // inject the ReqCompress flag. SetState/Commit/Discard are excluded
+    // because their payload shapes (nsId-keyed map / array of nsIds) would
+    // collide with the flag's uint16 key and break the server-side parser.
+    const wantsCompress = this.compressionEnabled && COMPRESSIBLE_OPS.has(opId);
+    const has = !!packPayload || wantsCompress;
     p.arr(has ? 3 : 2);
     p.int(opId);
     p.int(seq);
-    if (has) packPayload(p);
+    if (packPayload) {
+      // Caller-driven payload. Pass wantsCompress through ctx so the
+      // caller (e.g. getState) can fold ReqCompress into its own map.
+      packPayload(p, { wantsCompress });
+    } else if (wantsCompress) {
+      // No caller payload — emit a single-entry map carrying just the flag.
+      p.map(1);
+      p.int(WK.ReqCompress);
+      p.bool(true);
+    }
     const frame = kissEncode(CMD_PROVISION_REQ, p.result());
-    const timeout = (timeoutMs != null) ? timeoutMs : 5000;
+    // Per-call timeout wins; otherwise the transport's advertised default
+    // (RnsTransport publishes a longer one because LoRa Resource transfers
+    // can take 30+ seconds); final fallback is the snappy 5s default suited
+    // to Serial / BLE / WebSocket.
+    const transportDefault = (this.t && typeof this.t.defaultRequestTimeoutMs === 'number') ? this.t.defaultRequestTimeoutMs : null;
+    const timeout = (timeoutMs != null) ? timeoutMs : (transportDefault != null ? transportDefault : 5000);
     return new Promise((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         this.waiters.delete(seq);
@@ -958,7 +1492,15 @@ class ProvisioningClient {
   async getInfo(timeoutMs){
     const { body } = await this._request(OP.GetInfo, null, timeoutMs);
     const m = body instanceof Map ? body : new Map();
-    return { firmwareVersion: m.get(IK.FirmwareVersion), schemaVersion: m.get(IK.SchemaVersion), needsReboot: !!m.get(IK.NeedsReboot) };
+    // schemaHash is a uint32 CRC32 over the GetSchema response bytes. Older
+    // firmware that doesn't include it returns undefined here, which the
+    // schema cache layer treats as "uncacheable" and falls back to fetch.
+    return {
+      firmwareVersion: m.get(IK.FirmwareVersion),
+      schemaVersion: m.get(IK.SchemaVersion),
+      needsReboot: !!m.get(IK.NeedsReboot),
+      schemaHash: m.get(IK.SchemaHash),
+    };
   }
   async getSchema(){
     const { body } = await this._request(OP.GetSchema);
@@ -999,14 +1541,53 @@ class ProvisioningClient {
     }
     return { namespaces };
   }
+  // Resolve the device's schema, preferring (1) a build-time bundled schema
+  // whose hash matches the device, then (2) a localStorage cache entry keyed
+  // by (schemaVersion, schemaHash), then (3) a network GetSchema fetch. The
+  // hash is the CRC32 the firmware computes over the GetSchema response
+  // bytes at boot and reports in GetInfo; identical hashes imply identical
+  // schemas, so no per-device key is needed.
+  //
+  // Firmware that predates SchemaHash returns info.schemaHash === undefined,
+  // in which case we bypass cache and bundle and just fetch as before.
+  async resolveSchema(info){
+    const hash = info && info.schemaHash;
+    const ver  = info && info.schemaVersion;
+    if (hash == null || ver == null) return await this.getSchema();
+    const hashHex = (Number(hash) >>> 0).toString(16).padStart(8, '0');
+    const cacheKey = `mrf_schema_v${Number(ver)}_${hashHex}`;
+    // 1) Bundled (zero network).
+    if (BUNDLED_SCHEMA &&
+        Number(BUNDLED_SCHEMA.version) === Number(ver) &&
+        (Number(BUNDLED_SCHEMA.hash) >>> 0) === (Number(hash) >>> 0) &&
+        typeof BUNDLED_SCHEMA.schemaJson === 'string') {
+      try { return _schemaDeserialize(BUNDLED_SCHEMA.schemaJson); } catch(_) {}
+    }
+    // 2) localStorage cache.
+    try {
+      const raw = window.localStorage && localStorage.getItem(cacheKey);
+      if (raw) return _schemaDeserialize(raw);
+    } catch(_) {}
+    // 3) Fetch + persist.
+    const schema = await this.getSchema();
+    try {
+      if (window.localStorage) {
+        _schemaCachePrune(cacheKey);
+        localStorage.setItem(cacheKey, _schemaSerialize(schema));
+      }
+    } catch(_) { /* quota/disabled — non-fatal */ }
+    return schema;
+  }
   async getState(nsIds, pending){
-    const { body } = await this._request(OP.GetState, (p) => {
+    const { body } = await this._request(OP.GetState, (p, ctx) => {
       const hasFilter = Array.isArray(nsIds) && nsIds.length > 0;
-      const entries = (hasFilter ? 1 : 0) + (pending ? 1 : 0);
+      const compress = !!(ctx && ctx.wantsCompress);
+      const entries = (hasFilter ? 1 : 0) + (pending ? 1 : 0) + (compress ? 1 : 0);
       if (entries === 0) { p.nil(); return; }
       p.map(entries);
       if (hasFilter) { p.int(GK.NamespaceFilter); p.arr(nsIds.length); for (const n of nsIds) p.int(n); }
       if (pending) { p.int(GK.Pending); p.bool(true); }
+      if (compress) { p.int(WK.ReqCompress); p.bool(true); }
     });
     const out = {};
     if (body instanceof Map) {
@@ -1058,9 +1639,27 @@ class ProvisioningClient {
     const m = body instanceof Map ? body : new Map();
     return { needsReboot: !!m.get(CK.NeedsReboot) };
   }
+  // First-class Provisioning reboot — the library sends an Ack before
+  // invoking the registered reboot callback, so a healthy device responds.
+  // The Ack can still race with the actual reset (especially over slow RNS
+  // links), so we use a short per-call timeout and treat *timeout* as
+  // success: the request was emitted, the device almost certainly acted on
+  // it. The only hard failure we surface is UnknownOp (code 2) — a device
+  // too old to know about OP.Reboot — so callers can fall back cleanly to
+  // the legacy KISS reset path.
+  async requestReboot(){
+    try {
+      await this._request(OP.Reboot, null, 3000);
+    } catch (e) {
+      if (e && Number(e.code) === 2) throw e;   // UnknownOp — propagate
+      // timeout / connection-lost / link teardown mid-request — assume
+      // the reboot fired and let the caller proceed with teardown.
+    }
+  }
   // Fire-and-forget reset via the legacy RNode KISS reset frame
   // (FEND CMD_RESET CMD_RESET_BYTE FEND). The device reboots immediately,
-  // so there is no response — we just send the bytes.
+  // so there is no response — we just send the bytes. Used as the fallback
+  // for legacy RNodes that don't implement OP.Reboot.
   async reboot(){
     await this.t.send(kissEncode(CMD_RESET, new Uint8Array([CMD_RESET_BYTE])));
   }
@@ -1093,6 +1692,7 @@ function packTypedValue(p, type, v){
       for (const e of list) p.bin(e instanceof Uint8Array ? e : new Uint8Array(e || []));
       return;
     }
+    case FT.Void: p.nil(); return;   // Argument-less command marker.
     default: p.nil();
   }
 }
@@ -1364,6 +1964,10 @@ function el(tag, attrs, children){
 const state = {
   transportName: observable('serial'),
   wsUrl: observable('ws://localhost:8080'),
+  rnsUrl: observable('wss://127.0.0.1:9337/ws'),
+  rnsDestHash: observable(''),
+  rnsAspect: observable('rnstransport.remote.management'),
+  rnsAutoIdentify: observable(true),
   conn: observable({ state: 'idle' }),
   info: observable(null),
   schema: observable(null),
@@ -1427,6 +2031,7 @@ function createTransport(name){
   if (name === 'serial') return new SerialTransport();
   if (name === 'ble') return new BLETransport();
   if (name === 'ws') return new WebSocketTransport();
+  if (name === 'rns') return new RnsTransport();
   throw new Error('unknown transport ' + name);
 }
 
@@ -1452,6 +2057,15 @@ function clearSessionState(){
   state.nodeCfgNeedsReboot.set(false);
   state.legacySupported.set(null);
 }
+
+// Toggle a body class while the auto-reconnect loop is active so CSS can dim
+// and disable panel-body controls. The tab-strip already disables tab buttons
+// during reconnect; this extends the same affordance to the panel itself so
+// the user can't start typing into a field that's about to be overwritten by
+// the post-reconnect fetch.
+state.reconnecting.subscribe((r) => {
+  document.body.classList.toggle('is-reconnecting', !!r);
+});
 
 function wireClient(c){
   c.onLog = (text) => {
@@ -1499,6 +2113,12 @@ async function doConnect(){
     client = new ProvisioningClient(transport);
     wireClient(client);
     if (name === 'ws') await transport.connect(state.wsUrl.get());
+    else if (name === 'rns') await transport.connect({
+      meshchatxUrl: state.rnsUrl.get(),
+      destinationHash: state.rnsDestHash.get(),
+      aspect: state.rnsAspect.get(),
+      autoIdentify: state.rnsAutoIdentify.get(),
+    });
     else await transport.connect();
     await afterConnect();
   } catch (e) {
@@ -1509,7 +2129,7 @@ async function doConnect(){
 async function afterConnect(){
   try { state.info.set(await client.getInfo()); } catch (e) { console.error('getInfo:', e); showToast('Failed to fetch device info: ' + e.message, 'err'); }
   try {
-    const schema = await client.getSchema();
+    const schema = await client.resolveSchema(state.info.get());
     state.schema.set(schema);
     if (schema.namespaces.length > 0 && state.activeNsTab.get() == null) {
       // Default to the first ROOT namespace (parentId == 0) — children render
@@ -1545,16 +2165,14 @@ async function startReconnect(){
   if (!transport && lastTransportName !== 'ws') return;  // nothing to reconnect to
   const myToken = ++reconnectToken;
   state.reconnecting.set(true);
-  // Stale post-reboot schema/state would render with old committed values; clear
-  // it so the UI doesn't briefly show outdated data after we reconnect.
+  // Preserve nsState / nodeCfgState across the reconnect window so visible
+  // field values don't flash to field.default while the device is rebooting.
+  // Only invalidate the *Loaded flags — that triggers re-fetch once the device
+  // is back, which then overwrites these maps with fresh data. (Firmware drafts
+  // don't survive reboot, so we still reset the local draft-presence flags.)
   state.nsLoaded.set({});
-  state.nsState.set({});
   state.nsServerErrors.set({});
-  // Firmware draft cleared by reboot (the new boot starts fresh).
   state.firmwareHasDraft.set(false);
-  // Node Config side: drop cached reads (device may have rebooted), keep the
-  // selected sub-tab so the user lands back where they were.
-  state.nodeCfgState.set({});
   state.nodeCfgLoaded.set({});
   state.nodeCfgHasDraft.set(false);
   state.nodeCfgEeprom.set(null);
@@ -1580,6 +2198,18 @@ async function startReconnect(){
         client = new ProvisioningClient(transport);
         wireClient(client);
         await transport.connect(state.wsUrl.get());
+      } else if (lastTransportName === 'rns') {
+        // MeshChatX WS is gone; rebuild and re-open the Link.
+        transport = new RnsTransport();
+        transport.onStatus = onTransportStatus;
+        client = new ProvisioningClient(transport);
+        wireClient(client);
+        await transport.connect({
+          meshchatxUrl: state.rnsUrl.get(),
+          destinationHash: state.rnsDestHash.get(),
+          aspect: state.rnsAspect.get(),
+          autoIdentify: state.rnsAutoIdentify.get(),
+        });
       } else {
         await transport.reconnect();
         // Serial/BLE reuse the same client instance — clear stale waiters and
@@ -1609,9 +2239,12 @@ async function startReconnect(){
       state.reconnecting.set(false);
       showToast('Reconnected', 'ok');
 
-      // Refresh schema (usually stable across reboot, but cheap to re-fetch).
+      // Refresh schema. resolveSchema short-circuits via the in-memory cache /
+      // bundled schema if the device's hash is unchanged across the reboot —
+      // and only falls back to a real GetSchema fetch when the schema actually
+      // changed (e.g. firmware upgrade).
       try {
-        const schema = await client.getSchema();
+        const schema = await client.resolveSchema(info);
         state.schema.set(schema);
         if (schema.namespaces.length > 0 && state.activeNsTab.get() == null) {
           const firstRoot = schema.namespaces.find(n => !Number(n.parentId || 0)) || schema.namespaces[0];
@@ -1959,12 +2592,22 @@ async function reboot(){
     : 'Reboot the device now? You will be disconnected.';
   if (!confirm(msg)) return;
   try {
-    await client.reboot();
+    // Prefer the first-class Provisioning OP.Reboot — works over any
+    // transport, including RNS where legacy KISS CMD_RESET is filtered.
+    // UnknownOp (code 2) means the device's microReticulum is older than
+    // OP.Reboot; fall back to the legacy KISS path.
+    try {
+      await client.requestReboot();
+    } catch (e) {
+      if (e && Number(e.code) === 2) await client.reboot();
+      else throw e;
+    }
     // Reflect the imminent disconnect immediately, AND force-close the transport.
     // The force-close matters on UART-to-USB bridges (CP2102, CH340, etc) where
     // the host's serial connection survives the ESP32 reset — without it, the
     // read loop never observes a disconnect, 'closed' never fires, startReconnect
-    // never runs, and the UI is stuck in "Reconnecting…" forever.
+    // never runs, and the UI is stuck in "Reconnecting…" forever. On RNS it
+    // also fires rns.link.close so MeshChatX evicts its cached Link.
     if (auto) state.reconnecting.set(true);
     showToast(auto
       ? 'Reboot command sent — reconnecting…'
@@ -2061,6 +2704,28 @@ function buildTopBar(){
   const wsInput = el('input', { type: 'text', placeholder: 'ws://host:port', style: { width: '220px' } });
   wsInput.value = state.wsUrl.get();
   wsInput.oninput = (e) => state.wsUrl.set(e.target.value);
+  // Mount once; toggle visibility in update() so typing doesn't detach the
+  // focused input (which would drop focus on every keystroke).
+  wsHost.appendChild(wsInput);
+  // RNS-over-MeshChatX config: WS URL + destination hash + aspect + auto-identify.
+  const rnsHost = el('span', { style: { display: 'inline-flex', gap: '4px', alignItems: 'center' } });
+  const rnsUrlInput = el('input', { type: 'text', placeholder: 'ws://host:port/ws', style: { width: '200px' }, title: 'MeshChatX WebSocket URL' });
+  rnsUrlInput.value = state.rnsUrl.get();
+  rnsUrlInput.oninput = (e) => state.rnsUrl.set(e.target.value);
+  const rnsHashInput = el('input', { type: 'text', placeholder: 'destination hash (32 hex)', style: { width: '260px', fontFamily: 'monospace' }, maxlength: '32', title: 'Remote node destination hash (32 hex chars)' });
+  rnsHashInput.value = state.rnsDestHash.get();
+  rnsHashInput.oninput = (e) => state.rnsDestHash.set(e.target.value.trim());
+  const rnsAspectInput = el('input', { type: 'text', placeholder: 'aspect', style: { width: '220px' }, title: 'RNS destination aspect (dot-separated)' });
+  rnsAspectInput.value = state.rnsAspect.get();
+  rnsAspectInput.oninput = (e) => state.rnsAspect.set(e.target.value);
+  const rnsIdentCb = el('input', { type: 'checkbox' });
+  rnsIdentCb.checked = state.rnsAutoIdentify.get();
+  rnsIdentCb.onchange = (e) => state.rnsAutoIdentify.set(e.target.checked);
+  const rnsIdentLabel = el('label', { style: { display: 'inline-flex', alignItems: 'center', gap: '4px', cursor: 'pointer', color: 'var(--muted)' }, title: 'Send local identity on link establishment (required by /provision ALLOW_LIST)' }, [rnsIdentCb, 'authenticate']);
+  rnsHost.appendChild(rnsUrlInput);
+  rnsHost.appendChild(rnsHashInput);
+  rnsHost.appendChild(rnsAspectInput);
+  rnsHost.appendChild(rnsIdentLabel);
   const connectBtn = el('button');
   const disconnectBtn = el('button', null, 'Disconnect');
   const autoCheckbox = el('input', { type: 'checkbox' });
@@ -2068,7 +2733,7 @@ function buildTopBar(){
   autoCheckbox.onchange = (e) => state.autoReconnect.set(e.target.checked);
   const autoLabel = el('label', { style: { display: 'inline-flex', alignItems: 'center', gap: '4px', cursor: 'pointer', color: 'var(--muted)' }, title: 'Reconnect automatically after a reboot to capture early boot logs' }, [autoCheckbox, 'auto-reconnect']);
   const pill = el('span', { class: 'pill' });
-  const opts = [['serial','Serial'], ['ble','Bluetooth'], ['ws','WebSocket']];
+  const opts = [['serial','Serial'], ['ble','Bluetooth'], ['ws','WebSocket'], ['rns','RNS (via MeshChatX)']];
   for (const [v, lbl] of opts) sel.appendChild(el('option', { value: v }, lbl));
   sel.value = state.transportName.get();
   sel.onchange = (e) => state.transportName.set(e.target.value);
@@ -2080,12 +2745,17 @@ function buildTopBar(){
   root.appendChild(el('label', null, 'Transport: '));
   root.appendChild(sel);
   root.appendChild(wsHost);
+  root.appendChild(rnsHost);
   root.appendChild(connectBtn);
   root.appendChild(disconnectBtn);
   root.appendChild(autoLabel);
   root.appendChild(el('span', { class: 'spacer' }));
   root.appendChild(pill);
 
+  // Elapsed-time ticker state for the connecting badge. Declared outside
+  // update() so it survives across calls (it's the same closure each time).
+  let connectingStartedAt = null;
+  let elapsedTimer = null;
   function update(){
     const conn = state.conn.get();
     const tname = state.transportName.get();
@@ -2094,11 +2764,23 @@ function buildTopBar(){
     const connected = conn.state === 'connected';
     sel.disabled = connecting || connected || reconnecting;
     if (sel.value !== tname) sel.value = tname;
-    wsHost.innerHTML = '';
-    if (tname === 'ws') {
-      wsHost.appendChild(wsInput);
+    const showWs = (tname === 'ws');
+    wsInput.style.display = showWs ? '' : 'none';
+    if (showWs) {
       if (document.activeElement !== wsInput && wsInput.value !== state.wsUrl.get()) wsInput.value = state.wsUrl.get();
       wsInput.disabled = connecting || connected || reconnecting;
+    }
+    const showRns = (tname === 'rns');
+    rnsHost.style.display = showRns ? '' : 'none';
+    if (showRns) {
+      if (document.activeElement !== rnsUrlInput && rnsUrlInput.value !== state.rnsUrl.get()) rnsUrlInput.value = state.rnsUrl.get();
+      if (document.activeElement !== rnsHashInput && rnsHashInput.value !== state.rnsDestHash.get()) rnsHashInput.value = state.rnsDestHash.get();
+      if (document.activeElement !== rnsAspectInput && rnsAspectInput.value !== state.rnsAspect.get()) rnsAspectInput.value = state.rnsAspect.get();
+      if (rnsIdentCb.checked !== state.rnsAutoIdentify.get()) rnsIdentCb.checked = state.rnsAutoIdentify.get();
+      rnsUrlInput.disabled = connecting || connected || reconnecting;
+      rnsHashInput.disabled = connecting || connected || reconnecting;
+      rnsAspectInput.disabled = connecting || connected || reconnecting;
+      rnsIdentCb.disabled = connecting || connected || reconnecting;
     }
     connectBtn.disabled = connecting || connected || reconnecting;
     connectBtn.textContent = connecting ? 'Connecting…' : 'Connect';
@@ -2107,9 +2789,24 @@ function buildTopBar(){
     if (autoCheckbox.checked !== state.autoReconnect.get()) autoCheckbox.checked = state.autoReconnect.get();
     let txt = 'Disconnected', cls = 'st-idle';
     if (reconnecting) { txt = 'Reconnecting…'; cls = 'st-connecting'; }
-    else if (connecting) { txt = 'Connecting…'; cls = 'st-connecting'; }
+    else if (connecting) {
+      // Show the transport-supplied phase label (e.g. "WS connecting",
+      // "WS verifying", "Link connecting", "Finding path"…) plus the elapsed
+      // time so the user has feedback during slow LoRa-paced steps.
+      const label = (conn.info && String(conn.info).trim()) ? conn.info : 'Connecting';
+      if (connectingStartedAt === null) connectingStartedAt = Date.now();
+      if (elapsedTimer === null) elapsedTimer = setInterval(update, 1000);
+      const elapsed = Math.floor((Date.now() - connectingStartedAt) / 1000);
+      txt = label + '… ' + elapsed + 's';
+      cls = 'st-connecting';
+    }
     else if (connected) { txt = 'Connected' + (conn.info ? ` (${conn.info})` : ''); cls = 'st-ok'; }
     else if (conn.state === 'error') { txt = 'Error: ' + (conn.info || ''); cls = 'st-err'; }
+    // Stop the elapsed-time ticker once we leave 'connecting'.
+    if (!connecting && !reconnecting) {
+      connectingStartedAt = null;
+      if (elapsedTimer !== null) { clearInterval(elapsedTimer); elapsedTimer = null; }
+    }
     pill.className = 'pill ' + cls;
     pill.textContent = txt;
   }
@@ -2117,6 +2814,11 @@ function buildTopBar(){
   state.conn.subscribe(update);
   state.transportName.subscribe(update);
   state.wsUrl.subscribe(update);
+  state.rnsUrl.subscribe(update);
+  state.rnsDestHash.subscribe(update);
+  state.rnsAspect.subscribe(update);
+  state.rnsAutoIdentify.subscribe(update);
+
   state.autoReconnect.subscribe(update);
   state.reconnecting.subscribe(update);
   return root;
@@ -2155,21 +2857,33 @@ function buildTabBar(){
     // Treat "reconnecting" as not-yet-connected so per-tab actions don't fire
     // against a transport that's still being re-established.
     const connected = state.conn.get().state === 'connected' && !state.reconnecting.get();
-    const showCfg = transportConfigVisible();
-    // legacySupported starts null (not yet probed) — show Node Config until we
-    // confirm the device doesn't respond, to avoid hiding it before the probe
-    // completes on slower devices.
-    const showNcfg = state.legacySupported.get() !== false;
+    // Capability-gated visibility: every tab other than Node Status only
+    // surfaces once we've positively confirmed the active transport supports
+    // it. While disconnected (or reconnecting), only Node Status shows.
+    //   - Node Config (legacy KISS opcodes): requires legacySupported === true
+    //     (CMD_BOARD probe succeeded). Starts null and the probe takes up to
+    //     1500ms, during which we keep the tab hidden — a brief delay is
+    //     preferable to a flash-then-hide.
+    //   - Transport Config (Provisioning + RNS namespaces): requires
+    //     transportConfigVisible() (schema fetched and has an id<100 ns).
+    //   - Logs (KISS CMD_LOG frames from the device): not delivered over RNS
+    //     because RnsTransport only forwards CMD_PROVISION_RSP frames back.
+    const isRns = state.transportName.get() === 'rns';
+    const showNcfg = connected && state.legacySupported.get() === true;
+    const showCfg  = connected && transportConfigVisible();
+    const showLogs = connected && !isRns;
     for (const t of tabs) {
       const b = buttons[t.id];
       b.classList.toggle('active', active === t.id);
       b.disabled = !connected && t.id !== 'status';
-      if (t.id === 'config') b.style.display = showCfg ? '' : 'none';
+      if (t.id === 'config')     b.style.display = showCfg  ? '' : 'none';
       if (t.id === 'nodeconfig') b.style.display = showNcfg ? '' : 'none';
+      if (t.id === 'logs')       b.style.display = showLogs ? '' : 'none';
     }
     // Redirect away from any hidden tab so the user isn't on an invisible body.
-    if (!showCfg && active === 'config') state.activeTab.set('status');
+    if (!showCfg  && active === 'config')     state.activeTab.set('status');
     if (!showNcfg && active === 'nodeconfig') state.activeTab.set('status');
+    if (!showLogs && active === 'logs')       state.activeTab.set('status');
   }
   update();
   state.activeTab.subscribe(update);
@@ -2177,6 +2891,7 @@ function buildTabBar(){
   state.reconnecting.subscribe(update);
   state.schema.subscribe(update);
   state.legacySupported.subscribe(update);
+  state.transportName.subscribe(update);
   return root;
 }
 slots.tabbar.appendChild(buildTabBar());
@@ -2435,6 +3150,10 @@ function _buildFieldInput(f, opts){
       if (list == null) return { __error: 'odd hex on one of the lines' };
       return list;
     };
+  } else if (f.type === FT.Void) {
+    // Argument-less command — the Send button is the entire control surface.
+    input = null;
+    readValue = () => null;
   } else {
     input = el('span', null, '(unknown type)');
     readValue = () => null;
@@ -2483,7 +3202,7 @@ function buildFieldRowWriteOnly(nsId, f, c){
   // on Send. _buildFieldInput's readValue() returns {__error} for unparseable
   // hex/bytes-list content, which we surface in errEl below.
   const { input, readValue } = _buildFieldInput(f, { secret, bigBytesList: false });
-  controls.appendChild(input);
+  if (input) controls.appendChild(input);   // FT.Void has no input element.
 
   const sendBtn = el('button', { class: 'wo-send' }, 'Send');
   controls.appendChild(sendBtn);
@@ -2497,6 +3216,14 @@ function buildFieldRowWriteOnly(nsId, f, c){
     const verr = validateValue(f, v);
     if (verr) { errEl.textContent = verr; row.classList.add('has-err'); return; }
     errEl.textContent = ''; row.classList.remove('has-err');
+    // Write-only fields are imperative one-shot commands (Clear Storage,
+    // Clear Provisioning, reboots, etc.) that fire setters server-side with
+    // no draft / revert step. Always require an explicit confirmation so a
+    // misclick can't trigger a destructive action.
+    const label = f.label || f.name || 'this command';
+    if (!window.confirm(`Send "${label}"?\n\nThis is a one-shot command and cannot be undone.`)) {
+      return;
+    }
     sendBtn.disabled = true;
     const prevLbl = sendBtn.textContent || 'Send';
     sendBtn.textContent = 'Sending…';
@@ -2551,6 +3278,10 @@ function buildFieldRow(nsId, f, ctx){
   // to buildFieldRowWriteOnly), so we never need to disable inputs here.
   const secret = !!(f.flags & FF.SECRET);
   const reboot = !!(f.flags & FF.REBOOT_REQUIRED);
+  // Legacy Node Config fields with no KISS read counterpart. The displayed
+  // value is a schema placeholder, not a readback — surface this with a badge
+  // so the user doesn't mistake the placeholder for the device's current state.
+  const setOnly = (f.readable === false);
 
   // Build input ONCE; we never recreate it on subsequent state changes. Use
   // the regular-draft variant (bigBytesList=true) so BytesList textareas get
@@ -2599,6 +3330,10 @@ function buildFieldRow(nsId, f, ctx){
     if (ro) badges.appendChild(el('span', { class: 'badge ro' }, 'read-only'));
     if (secret) badges.appendChild(el('span', { class: 'badge secret' }, 'secret'));
     if (reboot) badges.appendChild(el('span', { class: 'badge reboot' }, '↻ reboot'));
+    if (setOnly) badges.appendChild(el('span', {
+      class: 'badge set-only',
+      title: 'Write-only on this device. The value shown is a schema placeholder; editing and Save writes the value to the device, but the firmware does not expose a read opcode for this field.'
+    }, 'set-only'));
     if (isDraft) badges.appendChild(el('span', { class: 'badge draft' }, '• draft'));
     // Errors — only surface validation errors for fields the user actually edited.
     // Untouched fields may carry firmware "sentinel" defaults (e.g. radio.frequency=0)
@@ -2687,10 +3422,17 @@ function buildNamespacePanel(nsId){
       wrap.appendChild(el(tag, { class: cls, style: { marginLeft: indent + 'px' } }, ns.name));
     }
     const indent = depth > 0 ? ((depth - 1) * INDENT_PX) + 'px' : '0';
-    if (!ns.fields || ns.fields.length === 0) {
-      wrap.appendChild(el('div', { class: 'ns-empty',
-        style: { color: 'var(--muted)', fontStyle: 'italic', marginLeft: indent } },
-        '(no fields)'));
+    const hasOwnFields = ns.fields && ns.fields.length > 0;
+    if (!hasOwnFields) {
+      // Suppress the "(no fields)" placeholder when this namespace is a
+      // container for child namespaces — they render in subsequent iterations
+      // of this same treeIds loop.
+      const hasChildren = getChildrenOf(schema, id).length > 0;
+      if (!hasChildren) {
+        wrap.appendChild(el('div', { class: 'ns-empty',
+          style: { color: 'var(--muted)', fontStyle: 'italic', marginLeft: indent } },
+          '(no fields)'));
+      }
       continue;
     }
     const section = el('div', { class: 'ns-sub-fields', style: { marginLeft: indent } });
@@ -2731,6 +3473,10 @@ function buildConfigTab(){
 
   // Cleanup for the inner-mounted namespace panel
   let nsCleanups = [];
+  // After this many ms in the "Loading…" state, show a "timed out + Refresh"
+  // view. Matches the RNS request timeout so on a stalled connection the
+  // UI surfaces a retry control instead of an indefinite spinner.
+  const LOAD_TIMEOUT_MS = 30000;
   function mountNs(nsId){
     for (const fn of nsCleanups) { try { fn(); } catch(_) {} }
     nsCleanups = [];
@@ -2745,6 +3491,19 @@ function buildConfigTab(){
     const allLoaded = treeIds.length > 0 && treeIds.every(id => !!loaded[id]);
     if (!allLoaded) {
       detail.appendChild(el('em', null, 'Loading…'));
+      const timerId = setTimeout(() => {
+        // Only swap to the timeout view if we're still in the loading state —
+        // a successful fetch in the meantime will have re-entered mountNs and
+        // cleared this timer via nsCleanups.
+        const cur = state.nsLoaded.get();
+        const stillLoading = !(treeIds.length > 0 && treeIds.every(id => !!cur[id]));
+        if (!stillLoading) return;
+        detail.innerHTML = '';
+        detail.appendChild(el('div', { class: 'notice' }, 'Loading timed out.'));
+        const retry = el('button', { class: 'primary', onclick: () => refreshNamespace(nsId) }, 'Refresh');
+        detail.appendChild(retry);
+      }, LOAD_TIMEOUT_MS);
+      nsCleanups.push(() => clearTimeout(timerId));
       fetchNamespaceIfNeeded(nsId);
       return;
     }
@@ -2807,14 +3566,12 @@ function buildConfigTab(){
   bodyCleanups.push(state.schema.subscribe(() => { rebuildSidenav(); mountNs(state.activeNsTab.get()); }));
   bodyCleanups.push(state.activeNsTab.subscribe((nsId) => { updateNavActive(); mountNs(nsId); }));
   bodyCleanups.push(state.nsLoaded.subscribe(() => {
+    // Remount on every nsLoaded change so transitions in both directions are
+    // visible: loaded → invalidated (Refresh / Save / Commit) shows the
+    // "Loading…" placeholder again with a fresh 30s timeout, and
+    // invalidated → loaded swaps back to the populated panel.
     const cur = state.activeNsTab.get();
-    if (cur != null) {
-      // Re-check whether the whole tree is now loaded; only remount once it is.
-      const schema = state.schema.get();
-      const ids = schema ? getNsTreeIds(schema, cur) : [Number(cur)];
-      const loaded = state.nsLoaded.get();
-      if (ids.length > 0 && ids.every(id => !!loaded[id])) mountNs(cur);
-    }
+    if (cur != null) mountNs(cur);
   }));
   bodyCleanups.push(state.nsState.subscribe(updateNavDots));
   bodyCleanups.push(() => { for (const fn of nsCleanups) try { fn(); } catch(_) {} });
@@ -2899,6 +3656,13 @@ function buildNcfgSchemaPanel(sectionId){
   const wrap = el('div', { class: 'ncfg-section' });
   wrap.appendChild(el('h2', null, sec.label));
 
+  // A section is fully "set-only" when every field is declared readable:false
+  // and there's no readFn to surface a value some other way. Refresh is
+  // meaningless in that case, and the displayed values are placeholders.
+  const setOnlySection = Array.isArray(sec.fields) && sec.fields.length > 0
+    && typeof sec.readFn !== 'function'
+    && sec.fields.every(f => f.readable === false);
+
   const toolbar = el('div', { class: 'ns-toolbar' });
   const saveBtn = el('button', null, 'Save ' + sec.label);
   const revertBtn = el('button', null, 'Revert');
@@ -2910,9 +3674,18 @@ function buildNcfgSchemaPanel(sectionId){
     ncfgFetchSection(sectionId);
   };
   toolbar.appendChild(saveBtn);
-  toolbar.appendChild(revertBtn);
-  toolbar.appendChild(refreshBtn);
+  // Revert and Refresh are meaningless for fully set-only sections (nothing
+  // on the device to revert against or refresh from), so hide them entirely.
+  if (!setOnlySection) {
+    toolbar.appendChild(revertBtn);
+    toolbar.appendChild(refreshBtn);
+  }
   wrap.appendChild(toolbar);
+
+  if (setOnlySection) {
+    wrap.appendChild(el('div', { class: 'set-only-banner' },
+      'This section is write-only. The device firmware does not expose these fields for readback over KISS, so the values shown below are schema placeholders, not the current device state. Edits take effect when you click Save.'));
+  }
 
   if (sec.saveTrailerNote) {
     wrap.appendChild(el('div', { class: 'ncfg-trailer' }, sec.saveTrailerNote));
@@ -3133,11 +3906,13 @@ function buildNcfgRadioPanel(){
             s['radio'] = { committed: { ...obj.committed, ...obj.draft }, draft: {} };
           });
           recomputeHasDraft(NCFG_CTX);
-        } else {
-          // No drafts but mode is changing → still ensure radio online + persist
-          // current lora_* via CMD_CONF_SAVE.
-          await legacy.setMode(true);
         }
+        // Bring the radio online and CMD_CONF_SAVE the current lora_* values
+        // to EEPROM. writeSection() above only updates RAM via per-field
+        // opcodes; without this, edited values revert on the next reboot.
+        // Also sets ADDR_CONF_OK so the device boots into TNC mode. Safe to
+        // call even when there were no drafts — covers the mode-change-only case too.
+        await legacy.setMode(true);
         state.nodeCfgNeedsReboot.set(true);
         showToast('Radio config persisted (device will boot in TNC mode)', 'warn');
       } else {
@@ -3434,6 +4209,29 @@ let logsContainer = null;
 let logsFollowing = true;
 let logsSavedScrollTop = 0;
 
+// ===== LOGFILTER-BEGIN — stripped by webconsole/package.sh when --strip-logfilter is given =====
+// Filtering is render-side only: logsBuffer always holds every received line,
+// so clearing/relaxing the filter restores past lines.
+let logsFilterText = '';
+let logsMinLevel = 9;  // 9 = LOG_MEM (all levels visible)
+const LOGFILTER_LVL_MAP = { '!!!':1, 'ERR':2, 'WRN':3, 'NOT':4, 'INF':5, 'VRB':6, 'DBG':7, '---':8, '...':9 };
+function lineLevel(line){
+  const m = line.match(/\[(!!!|ERR|WRN|NOT|INF|VRB|DBG|---|\.\.\.)\]/);
+  return m ? LOGFILTER_LVL_MAP[m[1]] : 5;  // default unprefixed lines to INFO
+}
+function lineMatches(line){
+  if (lineLevel(line) > logsMinLevel) return false;
+  if (logsFilterText && line.toLowerCase().indexOf(logsFilterText) === -1) return false;
+  return true;
+}
+function repaintLogs(){
+  if (!logsContainer) return;
+  while (logsContainer.firstChild) logsContainer.removeChild(logsContainer.firstChild);
+  for (const l of logsBuffer) if (lineMatches(l)) logsContainer.appendChild(el('div', { class: 'log-line' }, l));
+  if (logsFollowing) logsContainer.scrollTop = logsContainer.scrollHeight;
+}
+// ===== LOGFILTER-END =====
+
 function ensureLogsContainer(){
   if (logsContainer) return;
   logsContainer = el('div', { class: 'logs' });
@@ -3441,9 +4239,19 @@ function ensureLogsContainer(){
     logsFollowing = (logsContainer.scrollHeight - logsContainer.scrollTop - logsContainer.clientHeight) < 16;
     if (followPill) followPill.style.display = logsFollowing ? 'none' : '';
   });
-  for (const line of logsBuffer) logsContainer.appendChild(el('div', { class: 'log-line' }, line));
+  for (const line of logsBuffer) {
+    // ===== LOGFILTER-BEGIN — stripped by webconsole/package.sh when --strip-logfilter is given =====
+    if (!lineMatches(line)) continue;
+    // ===== LOGFILTER-END =====
+    logsContainer.appendChild(el('div', { class: 'log-line' }, line));
+  }
   logsListeners.add((newLines) => {
-    for (const l of newLines) logsContainer.appendChild(el('div', { class: 'log-line' }, l));
+    for (const l of newLines) {
+      // ===== LOGFILTER-BEGIN — stripped by webconsole/package.sh when --strip-logfilter is given =====
+      if (!lineMatches(l)) continue;
+      // ===== LOGFILTER-END =====
+      logsContainer.appendChild(el('div', { class: 'log-line' }, l));
+    }
     while (logsContainer.childNodes.length > 1000) logsContainer.removeChild(logsContainer.firstChild);
     if (logsFollowing && logsContainer.isConnected) logsContainer.scrollTop = logsContainer.scrollHeight;
   });
@@ -3467,6 +4275,18 @@ function buildLogsTab(){
     el('button', { onclick: clearLogs, title: 'Clear the log viewer (does not affect the device)' }, 'Clear'),
     el('span', { class: 'spacer' }),
   ]);
+  // ===== LOGFILTER-BEGIN — stripped by webconsole/package.sh when --strip-logfilter is given =====
+  const filterInput = el('input', { type: 'search', placeholder: 'Filter…', class: 'logs-filter', value: logsFilterText,
+    title: 'Substring filter (case-insensitive). Affects display only — all received lines stay buffered.',
+    oninput: (e) => { logsFilterText = e.target.value.toLowerCase(); repaintLogs(); } });
+  const levelOpts = [['1','Critical'],['2','Error'],['3','Warning'],['4','Notice'],['5','Info'],['6','Verbose'],['7','Debug'],['8','Trace'],['9','All']];
+  const levelSelect = el('select', { class: 'logs-level',
+    title: 'Show lines at or above this severity. Unprefixed lines treated as Info.',
+    onchange: (e) => { logsMinLevel = +e.target.value; repaintLogs(); } },
+    levelOpts.map(([v,t]) => el('option', { value: v, ...(+v === logsMinLevel ? { selected: true } : {}) }, t)));
+  toolbar.insertBefore(filterInput, toolbar.lastChild);
+  toolbar.insertBefore(levelSelect, toolbar.lastChild);
+  // ===== LOGFILTER-END =====
   followPill = el('button', { class: 'follow-pill', style: { display: logsFollowing ? 'none' : '' }, onclick: () => {
     logsFollowing = true; followPill.style.display = 'none';
     logsContainer.scrollTop = logsContainer.scrollHeight;
